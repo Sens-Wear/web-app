@@ -18,4 +18,4 @@ The brand is SensWear. Preserve this spelling in all new UI and documentation.
 - Run typecheck, unit tests, production build, and affected browser workflows.
 - Never claim physical testing from mocked or headless checks. See HARDWARE_VALIDATION.md.
 - Do not publish, deploy, flash firmware, or connect to hardware unless requested.
-- Do not edit the mobile app or SDK repositories unless they are explicitly in scope.
+- Do not edit the mobile app or SDK repositories unless they are explicitly in scope. 
