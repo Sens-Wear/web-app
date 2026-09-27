@@ -1,0 +1,26 @@
+node_modules/
+dist/
+playwright-report/
+test-results/
+coverage/
+*.log
+.env*
+!.env.example
+.DS_Store
+
+# Local credentials, deployment keys and machine configuration
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+webapp-lightsail-deploy*
+lightsail_known_hosts*
+lightsail_host_ed25519.pub
+.ssh/
+.aws/
+*.tgz
+*.tsbuildinfo
+__pycache__/

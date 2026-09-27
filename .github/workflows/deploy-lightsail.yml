@@ -1,0 +1,222 @@
+name: Deploy Web App to Lightsail
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Grant permissions per job. Pull requests never receive production credentials.
+permissions: {}
+
+concurrency:
+  group: web-app-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CI: 'true'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Test restricted deployment receiver
+        run: npm run test:deployment
+
+      - name: Build production app
+        run: npm run build
+
+      - name: Install Chromium
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Test the production build in desktop and mobile browsers
+        run: npm run test:e2e -- --workers=2
+
+      - name: Package verified static release
+        if: >-
+          github.repository == 'Sens-Wear/web-app' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s dist/index.html
+          test -d dist/assets
+          printf '%s\n' "${GITHUB_SHA}" > dist/revision.txt
+          tar --create --gzip --file "${RUNNER_TEMP}/web-app.tar.gz" --directory dist .
+
+      - name: Store verified release from this run
+        if: >-
+          github.repository == 'Sens-Wear/web-app' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: web-app-release
+          path: ${{ runner.temp }}/web-app.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  deploy:
+    name: Deploy production
+    needs: build
+    if: >-
+      github.repository == 'Sens-Wear/web-app' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: https://app.sens-wear.com
+    env:
+      RELEASE_ID: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      # An older queued run must not replace a newer main commit.
+      - name: Check this is still the latest main commit
+        id: current
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          remote_sha="$(git ls-remote --exit-code https://github.com/Sens-Wear/web-app.git refs/heads/main | cut -f1)"
+          if [[ "${remote_sha}" != "${GITHUB_SHA}" ]]; then
+            echo '::notice::A newer main commit exists; skipping this older deployment.'
+            exit 0
+          fi
+          echo 'deploy=true' >> "${GITHUB_OUTPUT}"
+
+      # There is no source checkout, dependency install, or artifact execution here.
+      - name: Download verified release from this run
+        if: steps.current.outputs.deploy == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: web-app-release
+          path: ${{ runner.temp }}/web-app-release
+
+      - name: Configure deployment key and pinned host identity
+        if: steps.current.outputs.deploy == 'true'
+        shell: bash
+        env:
+          LIGHTSAIL_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          LIGHTSAIL_USER: ${{ secrets.LIGHTSAIL_USER }}
+          LIGHTSAIL_SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_PRIVATE_KEY }}
+          LIGHTSAIL_KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          for variable in LIGHTSAIL_HOST LIGHTSAIL_USER LIGHTSAIL_SSH_PRIVATE_KEY LIGHTSAIL_KNOWN_HOSTS; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Missing production environment secret: ${variable}. See DEPLOYMENT.md."
+              exit 1
+            fi
+          done
+          [[ "${LIGHTSAIL_HOST}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || {
+            echo '::error::LIGHTSAIL_HOST must be a static IPv4 address or direct SSH hostname.'
+            exit 1
+          }
+          [[ "${LIGHTSAIL_USER}" == 'webapp-deploy' ]] || {
+            echo '::error::Use the restricted webapp-deploy account described in DEPLOYMENT.md.'
+            exit 1
+          }
+          printf '%s\n' "${LIGHTSAIL_SSH_PRIVATE_KEY}" | tr -d '\r' > "${RUNNER_TEMP}/webapp-deploy-key"
+          printf '%s\n' "${LIGHTSAIL_KNOWN_HOSTS}" | tr -d '\r' > "${RUNNER_TEMP}/webapp-known-hosts"
+          ssh-keygen -y -P '' -f "${RUNNER_TEMP}/webapp-deploy-key" > /dev/null
+          ssh-keygen -F "${LIGHTSAIL_HOST}" -f "${RUNNER_TEMP}/webapp-known-hosts" > /dev/null || {
+            echo '::error::LIGHTSAIL_KNOWN_HOSTS has no verified entry for LIGHTSAIL_HOST.'
+            exit 1
+          }
+
+      - name: Activate release on Lightsail
+        id: activate
+        if: steps.current.outputs.deploy == 'true'
+        shell: bash
+        env:
+          LIGHTSAIL_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          LIGHTSAIL_USER: ${{ secrets.LIGHTSAIL_USER }}
+        run: |
+          set -Eeuo pipefail
+          test -s "${RUNNER_TEMP}/web-app-release/web-app.tar.gz"
+          [[ "${RELEASE_ID}" =~ ^[0-9a-f]{40}-[0-9]+-[0-9]+$ ]]
+          echo 'attempted=true' >> "${GITHUB_OUTPUT}"
+          ssh -F /dev/null -T -i "${RUNNER_TEMP}/webapp-deploy-key" \
+            -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="${RUNNER_TEMP}/webapp-known-hosts" \
+            -o ForwardAgent=no -o ClearAllForwardings=yes \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${LIGHTSAIL_USER}@${LIGHTSAIL_HOST}" "deploy ${RELEASE_ID}" \
+            < "${RUNNER_TEMP}/web-app-release/web-app.tar.gz"
+
+      - name: Verify public HTTPS release
+        id: verify
+        if: steps.current.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for attempt in {1..6}; do
+            revision="$(curl --proto '=https' --fail --silent --show-error --connect-timeout 10 --max-time 20 \
+              "https://app.sens-wear.com/revision.txt?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")" || revision=''
+            if [[ "${revision}" == "${GITHUB_SHA}" ]]; then
+              break
+            fi
+            sleep 5
+          done
+          [[ "${revision}" == "${GITHUB_SHA}" ]] || {
+            echo '::error::The public domain is not serving the expected revision.'
+            exit 1
+          }
+          homepage="$(curl --proto '=https' --fail --silent --show-error --connect-timeout 10 --max-time 20 \
+            "https://app.sens-wear.com/?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
+          [[ "${homepage}" == *'SensWear'* && "${homepage}" == *'<div id="root"></div>'* ]] || {
+            echo '::error::The public homepage did not pass its smoke test.'
+            exit 1
+          }
+
+      - name: Roll back an unverified release
+        if: >-
+          always() && steps.activate.outputs.attempted == 'true' &&
+          steps.verify.outcome != 'success'
+        shell: bash
+        env:
+          LIGHTSAIL_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          LIGHTSAIL_USER: ${{ secrets.LIGHTSAIL_USER }}
+        run: |
+          set -Eeuo pipefail
+          # The server refuses to roll back anything except this exact current release.
+          ssh -F /dev/null -T -i "${RUNNER_TEMP}/webapp-deploy-key" \
+            -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="${RUNNER_TEMP}/webapp-known-hosts" \
+            -o ForwardAgent=no -o ClearAllForwardings=yes \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${LIGHTSAIL_USER}@${LIGHTSAIL_HOST}" "rollback ${RELEASE_ID}"
+
+      - name: Remove temporary SSH material
+        if: always()
+        shell: bash
+        run: rm -f -- "${RUNNER_TEMP}/webapp-deploy-key" "${RUNNER_TEMP}/webapp-known-hosts"
